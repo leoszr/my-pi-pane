@@ -5,8 +5,11 @@ import type {
 } from "@mariozechner/pi-coding-agent";
 import { Spacer, type TUI, type EditorTheme } from "@mariozechner/pi-tui";
 import { PiPaneEditor } from "./editor.js";
+import { renderPiPaneFooter } from "./footer.js";
+import { setUsageUpdateRenderer } from "./usage.js";
 import { patchUserMessage } from "./message.js";
 import { renderHeader, patchStartupListing, type ListingRef } from "./startup.js";
+import { patchToolExecutionComponent, ToolActivityStore } from "./tool-activity.js";
 
 // Survives module reloads — Symbol.for() returns the same ref
 const REAL_SET_EDITOR = Symbol.for("pi-pane:realSetEditor");
@@ -75,17 +78,44 @@ suppressStdout();
 
 export default function piPaneExtension(pi: ExtensionAPI) {
   const responseTimes: number[] = [];
+  const toolActivity = new ToolActivityStore();
   let turnStartMs = 0;
 
   pi.on("turn_start", () => {
     turnStartMs = Date.now();
     responseTimes.push(0);
+    toolActivity.turnStart();
   });
 
   pi.on("turn_end", () => {
     if (responseTimes.length > 0) {
       responseTimes[responseTimes.length - 1] = Date.now() - turnStartMs;
     }
+    toolActivity.turnEnd();
+  });
+
+  pi.on("input", () => {
+    toolActivity.input();
+  });
+
+  pi.on("tool_call", (event) => {
+    toolActivity.call(event.toolCallId, event.toolName);
+  });
+
+  pi.on("tool_execution_start", (event) => {
+    toolActivity.start(event.toolCallId, event.toolName);
+  });
+
+  pi.on("tool_execution_end", (event) => {
+    toolActivity.end(event.toolCallId, event.toolName, event.isError);
+  });
+
+  pi.on("tool_result", (event) => {
+    toolActivity.end(event.toolCallId, event.toolName, event.isError);
+  });
+
+  pi.on("session_shutdown", () => {
+    toolActivity.dispose();
   });
 
   pi.on("session_start", (_event, ctx) => {
@@ -97,9 +127,11 @@ export default function piPaneExtension(pi: ExtensionAPI) {
     ui[REAL_SET_EDITOR] = realSetEditor;
 
     const getTheme = () => ui.theme as Theme;
+    toolActivity.setRenderer(() => tuiRef?.requestRender(true));
 
     ctx.ui.setWorkingMessage("\u200b");
     patchUserMessage(getTheme, responseTimes);
+    patchToolExecutionComponent(toolActivity, getTheme);
 
     // Custom header + intercept TUI ref for listing patch
     const capturedModels: string[] | undefined = g[CAPTURED_MODELS];
@@ -148,6 +180,16 @@ export default function piPaneExtension(pi: ExtensionAPI) {
           shutdown: () => ctx.shutdown(),
         }),
     );
+
+    ctx.ui.setFooter((tui, theme) => {
+      toolActivity.setRenderer(() => tui.requestRender(true));
+      setUsageUpdateRenderer(() => tui.requestRender(true));
+      return {
+        render: (width: number) => renderPiPaneFooter(theme as unknown as Theme, ctx, width),
+        invalidate() {},
+        dispose() { toolActivity.setRenderer(undefined); setUsageUpdateRenderer(undefined); tui.requestRender(true); },
+      };
+    });
 
     // Prevent other extensions from replacing the editor
     ctx.ui.setEditorComponent = () => {};
